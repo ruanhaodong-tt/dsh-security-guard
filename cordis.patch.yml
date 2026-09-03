@@ -1,0 +1,16 @@
+# dsh-security-guard bundle patch: insert runtime security guards into the
+# DSH profile. The core guard shadows ctx.loader.import (QVD-2026-52631);
+# the web guard intercepts forged Host headers (QVD-2026-57410).
+# Both guards are optional -- they degrade gracefully when the required
+# service is absent (e.g. headless mode has no webServer).
+
+- insert:
+    - id: dsh-security-core
+      name: dsh-security-guard/core
+      inject: [loader]
+
+    - id: dsh-security-web
+      name: dsh-security-guard/web
+      inject: [webServer]
+      disabled: false
+      config: {}

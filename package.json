@@ -1,0 +1,51 @@
+{
+  "name": "dsh-security-guard",
+  "description": "DSH runtime security guard plugin — loader import confinement, HTTP Host header validation, and sandbox service deny-list (QVD-2026-52631/57410/52644/52646). AI-assisted patch.",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruanhaodong-tt/DSH-Security-Patch.git"
+  },
+  "type": "module",
+  "main": "lib/core.js",
+  "types": "lib/core.d.ts",
+  "exports": {
+    "./core": {
+      "types": "./lib/core.d.ts",
+      "default": "./lib/core.js"
+    },
+    "./web": {
+      "types": "./lib/web.d.ts",
+      "default": "./lib/web.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/core.js",
+    "lib/core.d.ts",
+    "lib/web.js",
+    "lib/web.d.ts",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
+    "@deepseek-ai/cordis-plugin-loader": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
+    "@deepseek-ai/dsh-host-webserver": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-host-webserver": {
+      "optional": true
+    }
+  }
+}
