@@ -1,0 +1,310 @@
+diff --git a/packages/client/connection/src/api-request-trust.ts b/packages/client/connection/src/api-request-trust.ts
+index ea8914c..f96ea19 100644
+--- a/packages/client/connection/src/api-request-trust.ts
++++ b/packages/client/connection/src/api-request-trust.ts
+@@ -14,11 +14,22 @@
+  */
+ 
+ import type { IncomingHttpHeaders } from 'node:http'
+-import { isLoopbackHostname } from './loopback-hostname.ts'
++import { isLoopbackHostname, isLoopbackPeerAddress } from './loopback-hostname.ts'
+ 
+ /** The request facts the fence reads from either HTTP representation. */
+ interface ApiTrustRequest {
+   headers: IncomingHttpHeaders | Headers
++  /**
++   * The socket peer's real address (`net.AddressInfo.address`). A Host header
++   * can be forged by any client, but the peer address cannot. Required to
++   * honor a loopback Host claim.
++   */
++  remoteAddress?: string | undefined
++}
++
++/** Adapt a node:http request for the trust fence, carrying its real peer address. */
++export function trustRequest(req: { headers: IncomingHttpHeaders; socket?: { remoteAddress?: string | undefined } | null }): ApiTrustRequest {
++  return { headers: req.headers, remoteAddress: req.socket?.remoteAddress }
+ }
+ 
+ function header(headers: IncomingHttpHeaders | Headers, name: string): string | undefined {
+@@ -105,7 +116,15 @@ export function isTrustedApiRequest(request: ApiTrustRequest, trustedHosts: read
+   if (host === undefined) return false
+   const hostUrl = parseAuthority(host)
+   if (hostUrl === undefined) return false
+-  if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false
++  const loopbackHost = isLoopbackHostname(hostUrl.hostname)
++  if (!loopbackHost && !isTrustedAuthority(hostUrl, trustedHosts)) return false
++  // Loopback binding (QVD-2026-57410): a Host can be forged, so a request that
++  // claims loopback must actually ARRIVE from a loopback socket peer. Refusing
++  // here blocks the forged-Host RCE path (attacker connects over the public
++  // interface, spoofs `Host: localhost:port`, and would otherwise pass).
++  // trustedHosts ("non-loopback authority this deployment serves") still honors
++  // an admin-configured Host — that grant is explicit, not derived from Host.
++  if (loopbackHost && !isLoopbackPeerAddress(request.remoteAddress ?? '')) return false
+   // Cross-site fence: modern browsers label the initiator relationship on
+   // every fetch; an explicit cross-site marker is refused regardless of Origin.
+   if (header(request.headers, 'sec-fetch-site') === 'cross-site') return false
+diff --git a/packages/client/connection/src/http-bridge.ts b/packages/client/connection/src/http-bridge.ts
+index 07fc0fc..1e8650f 100644
+--- a/packages/client/connection/src/http-bridge.ts
++++ b/packages/client/connection/src/http-bridge.ts
+@@ -72,6 +72,15 @@ export async function bridge(
+     ...chunks.length > 0 ? { body: Buffer.concat(chunks) } : {},
+     signal: abort.signal,
+   })
++  // Carry the socket peer address onto the fetch request so downstream trust
++  // fences can bind a loopback Host claim to a real loopback peer. A forged
++  // Host header is not evidence of origin; the socket address is. Hidden from
++  // enumeration so it never leaks into serialization or forwarded headers.
++  Object.defineProperty(request, 'remoteAddress', {
++    value: req.socket?.remoteAddress,
++    enumerable: false,
++    configurable: false,
++  })
+   const response = await apiHandler.fetch(request)
+   res.writeHead(response.status, Object.fromEntries(response.headers.entries()))
+   if (response.body === null) {
+diff --git a/packages/client/connection/src/index.ts b/packages/client/connection/src/index.ts
+index a1764a3..b0da8b2 100644
+--- a/packages/client/connection/src/index.ts
++++ b/packages/client/connection/src/index.ts
+@@ -7,7 +7,7 @@ import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
+ import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
+ import { API_PATH, HOST_EVENTS_PATH, MUX_EVENTS_PATH } from './api-path.ts'
+ import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
+-import { assertTrustedAuthority, isTrustedApiRequest } from './api-request-trust.ts'
++import { assertTrustedAuthority, isTrustedApiRequest, trustRequest } from './api-request-trust.ts'
+ import { HostConnectionService } from './rpc-host.ts'
+ import { rejectWebSocketUpgrade, WebSocketDownlinks } from './websocket-downlink.ts'
+ 
+@@ -162,7 +162,7 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
+     kind: 'prefix',
+     path: API_PATH,
+     handler: async (req, res) => {
+-      if (!isTrustedApiRequest(req, trustedHosts)) {
++      if (!isTrustedApiRequest(trustRequest(req), trustedHosts)) {
+         res.writeHead(403)
+         res.end('forbidden')
+         return
+@@ -181,7 +181,7 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
+       apiCtx.effect(() => apiCtx.webServer.registerUpgrade({
+         path,
+         handler: (req, socket, head) => {
+-          if (!isTrustedApiRequest(req, trustedHosts)) {
++          if (!isTrustedApiRequest(trustRequest(req), trustedHosts)) {
+             rejectWebSocketUpgrade(socket)
+             return
+           }
+diff --git a/packages/client/connection/src/loopback-hostname.ts b/packages/client/connection/src/loopback-hostname.ts
+index fe2fe93..8624919 100644
+--- a/packages/client/connection/src/loopback-hostname.ts
++++ b/packages/client/connection/src/loopback-hostname.ts
+@@ -16,3 +16,18 @@ export function isLoopbackHostname(hostname: string): boolean {
+     && parts[0] === '127'
+     && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+ }
++
++/**
++ * Whether a socket peer address (as Node reports it) names the loopback
++ * network. This is the source-of-truth check for a request whose Host header
++ * claims loopback: a Host can be forged, but the peer's real address cannot.
++ * Node reports IPv4-mapped IPv6 peers (an IPv4 client on an IPv6 socket) as
++ * `::ffff:127.0.0.1`, so the mapped prefix is normalized before classification.
++ * @param remoteAddress - the socket's `net.AddressInfo.address`.
++ * @returns true when the peer is a loopback literal.
++ */
++export function isLoopbackPeerAddress(remoteAddress: string): boolean {
++  const address = remoteAddress.replace(/^::ffff:/i, '').replace(/^\[|\]$/g, '')
++  if (address === '::1' || address === 'localhost') return true
++  return isLoopbackHostname(address)
++}
+diff --git a/packages/client/connection/src/rpc-host.ts b/packages/client/connection/src/rpc-host.ts
+index 0da66c8..d626984 100644
+--- a/packages/client/connection/src/rpc-host.ts
++++ b/packages/client/connection/src/rpc-host.ts
+@@ -12,7 +12,7 @@ import {
+   type ServerResponse as RpcServerResponse,
+ } from '@deepseek-ai/dsh-host-apiproxy/api'
+ import { bridge, type FetchHandler } from './http-bridge.ts'
+-import { isTrustedApiRequest } from './api-request-trust.ts'
++import { isTrustedApiRequest, trustRequest } from './api-request-trust.ts'
+ import { API_PATH } from './api-path.ts'
+ import type {
+   ConnectionRpcEndpointMatcher,
+@@ -100,7 +100,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
+       kind: 'prefix',
+       path: channel,
+       handler: async (req, res) => {
+-        if (!isTrustedApiRequest(req, trustedHosts)) {
++        if (!isTrustedApiRequest(trustRequest(req), trustedHosts)) {
+           res.writeHead(403)
+           res.end('forbidden')
+           return
+diff --git a/packages/client/connection/tests/api-request-trust.host.spec.ts b/packages/client/connection/tests/api-request-trust.host.spec.ts
+index f145230..82ad184 100644
+--- a/packages/client/connection/tests/api-request-trust.host.spec.ts
++++ b/packages/client/connection/tests/api-request-trust.host.spec.ts
+@@ -3,8 +3,8 @@
+ import { describe, expect, it } from 'vitest'
+ import { assertTrustedAuthority, isTrustedApiRequest } from '../src/api-request-trust.ts'
+ 
+-function request(headers: Record<string, string | undefined>): { headers: Record<string, string | undefined> } {
+-  return { headers }
++function request(headers: Record<string, string | undefined>, remoteAddress = '127.0.0.1'): { headers: Record<string, string | undefined>; remoteAddress: string } {
++  return { headers, remoteAddress }
+ }
+ 
+ describe('isTrustedApiRequest', () => {
+@@ -33,6 +33,30 @@ describe('isTrustedApiRequest', () => {
+     }), [])).toBe(false)
+   })
+ 
++  it('refuses a forged loopback Host from a non-loopback peer (QVD-2026-57410)', () => {
++    // The Host header is forgeable; the socket peer address is not. An attacker
++    // connecting over the public interface and spoofing `Host: localhost` must
++    // not pass the fence.
++    for (const host of ['localhost:3080', '127.0.0.1:3080', '[::1]:3080']) {
++      for (const remote of ['203.0.113.5', '192.168.1.5', '::ffff:203.0.113.5']) {
++        expect(isTrustedApiRequest(request({ host }, remote), [])).toBe(false)
++      }
++    }
++    // A loopback Host from a real loopback peer is still honored. In an e2e
++    // test the peer address is synthesized; port-free IPv4/IPv6 spellings and
++    // the ::ffff: mapped form all classify as loopback.
++    expect(isTrustedApiRequest(request({ host: 'localhost:3080' }, '::1'), [])).toBe(true)
++    expect(isTrustedApiRequest(request({ host: '127.0.0.1:3080' }, '::ffff:127.0.0.1'), [])).toBe(true)
++    expect(isTrustedApiRequest(request({ host: '[::1]:3080' }, '0:0:0:0:0:0:0:1'), [])).toBe(false)
++  })
++
++  it('refuses a loopback Host claim with no peer address at all', () => {
++    // fail-closed: if the transport could not attest the peer, loopback trust
++    // is not granted.
++    // eslint-disable-next-line @typescript-eslint/no-explicit-any
++    expect(isTrustedApiRequest({ headers: { host: 'localhost:3080' } } as any, [])).toBe(false)
++  })
++
+   it('accepts a declared public authority: exact on host:port entries, any port on port-less entries', () => {
+     const headers = { host: 'harness.internal:3080', origin: 'http://harness.internal:3080' }
+     expect(isTrustedApiRequest(request(headers), ['harness.internal:3080'])).toBe(true)
+@@ -105,4 +129,4 @@ describe('isTrustedApiRequest', () => {
+     expect(isTrustedApiRequest(request({ ...markers, host: '127.0.0.999' }), [])).toBe(false)
+     expect(isTrustedApiRequest(request({ ...markers, host: '128.0.0.1' }), [])).toBe(false)
+   })
+-})
++})
+\ No newline at end of file
+diff --git a/packages/extensions/cordis-host-runner/src/guard.ts b/packages/extensions/cordis-host-runner/src/guard.ts
+index bc1a1ff..e32017c 100644
+--- a/packages/extensions/cordis-host-runner/src/guard.ts
++++ b/packages/extensions/cordis-host-runner/src/guard.ts
+@@ -526,6 +526,29 @@ function describeReturn(value: JsonValue): string {
+   return json.length > RETURN_PREVIEW_LIMIT ? `${json.slice(0, RETURN_PREVIEW_LIMIT)}…` : json
+ }
+ 
++/**
++ * The minimal, JSON-safe view of ToolExecution handed to a SANDBOX-defined
++ * tool's `execute` (QVD-2026-52644). The real `exec` carries `agent`, `token`,
++ * `signal`, and `parent` — live host handles a model-written closure could
++ * climb from to reach the runtime (Agent → Context → services). Dynamic
++ * execute only needs caller identity and its own scalar fields, so every
++ * object-valued field is withheld.
++ */
++function execView(exec: unknown): Record<string, unknown> {
++  if (!isPlainRecord(exec)) return {}
++  const agent = exec.agent
++  const isIdScalar = agent !== null && typeof agent === 'object'
++    && (typeof (agent as { id?: unknown }).id === 'string' || typeof (agent as { id?: unknown }).id === 'number')
++  return {
++    name: typeof exec.name === 'string' ? exec.name : undefined,
++    schemaName: typeof exec.schemaName === 'string' ? exec.schemaName : undefined,
++    callId: typeof exec.callId === 'string' ? exec.callId : undefined,
++    rootCallId: typeof exec.rootCallId === 'string' ? exec.rootCallId : undefined,
++    // Only the scalar agent id is handed out; the live Agent object is withheld.
++    agent: isIdScalar ? { id: (agent as { id: string | number }).id } : undefined,
++  }
++}
++
+ /**
+  * Validate and host-materialize a sandbox renderer's content blocks.
+  */
+@@ -580,7 +603,7 @@ export function sandboxDefineTool(options: unknown): ToolDefinition {
+       } : {},
+     },
+     async execute(args: unknown, exec: unknown): Promise<JsonValue> {
+-      return cloneJson(await rawExecute(args, exec), 'harness.defineTool execute result') as JsonValue
++      return cloneJson(await rawExecute(args, execView(exec)), 'harness.defineTool execute result') as JsonValue
+     },
+   })
+   const parameters = { ...tool.parameters, ...normalized.rootAnnotations }
+@@ -636,6 +659,16 @@ export function sandboxRegisterTool(ctx: Context, tool: unknown): () => void {
+ const CTX_VERBS = new Set(['effect', 'on', 'once', 'provide', 'timeout', 'interval', 'setTimeout', 'setInterval', 'throttle', 'debounce'])
+ const TIMER_VERBS = new Set(['timeout', 'interval', 'setTimeout', 'setInterval', 'throttle', 'debounce'])
+ 
++/**
++ * Process-launch services withheld from dynamic (sandbox) host halves even
++ * when a model-written package declares them (QVD-2026-52646). A prompt-injected
++ * `cordis_define` must not be able to obtain a live process runner, reach a real
++ * Context, and launch host binaries past the process sandbox. Dynamic packages
++ * stay cooperative extensions: they may reach data services and their own tools,
++ * but not a process runner.
++ */
++const DENIED_SANDBOX_SERVICES = new Set(['bash', 'terminal', 'subprocess'])
++
+ /**
+  * The tool-registry façade: `register` (marker-guarded) plus READ-ONLY
+  * metadata (`schemas`, and `get` returning a schema view, never the live
+@@ -737,6 +770,13 @@ function sandboxContext(ctx: Context, reportFailure: (error: Error) => void): Co
+   // is the façade's own API on either path.
+   const readService = (name: string, requireDeclaration: boolean): unknown => {
+     if (name === 'tools') return tools
++    if (DENIED_SANDBOX_SERVICES.has(name)) {
++      return rejectGuard(reportFailure,
++        `service "${name}" is not available to dynamic packages: it launches host processes, `
++        + 'which a prompt-injected package must not reach. Drive processes through the session\'s '
++        + 'Bash tool instead, which runs approval and the process sandbox.',
++      )
++    }
+     if (requireDeclaration && !declared.has(name)) return denyRead(name)
+     const service = denyContext(ctx.get(name), name, reportFailure)
+     if (service === null || (typeof service !== 'object' && typeof service !== 'function')) return service
+diff --git a/vendor/loader/src/config/tree.ts b/vendor/loader/src/config/tree.ts
+index c1925f0..a90f81c 100644
+--- a/vendor/loader/src/config/tree.ts
++++ b/vendor/loader/src/config/tree.ts
+@@ -144,7 +144,11 @@ export abstract class EntryTree {
+   /** Import a plugin module from a specifier or `cordis:` builtin. */
+   import(name: string, getOuterStack?: () => string[]) {
+     if (name.startsWith('cordis:')) {
+-      return this.ctx.loader.builtins[name.slice(7)]
++      const builtin = this.ctx.loader.builtins[name.slice(7)]
++      if (builtin === undefined) {
++        throw new Error(`loader: unknown cordis builtin "${name.slice(7)}"`)
++      }
++      return builtin
+     }
+     return composeError(async (info) => {
+       // ModuleJob.run
+@@ -154,8 +158,23 @@ export abstract class EntryTree {
+       if (this.ctx.loader.internal) {
+         return await this.ctx.loader.internal.import(name, this.ctx.baseUrl!, {})
+       } else if (name.startsWith('.')) {
+-        return await import(/* @vite-ignore */new URL(name, this.ctx.baseUrl).href)
++        // Confinement (QVD-2026-52631): relative plugin imports stay inside
++        // the project/preset root so a config cannot load a module from
++        // outside its own tree (directory traversal) by writing ../…
++        const basePath = new URL(this.ctx.baseUrl ?? 'file:///').href
++        const resolved = new URL(name, basePath).href
++        const root = new URL('.', basePath).href
++        if (!resolved.startsWith(root)) {
++          throw new Error(`loader: refusing to import "${name}" — it resolves outside the project root`, { cause: resolved })
++        }
++        return await import(/* @vite-ignore */resolved)
+       } else {
++        // Bare specifiers are npm packages (the deployment's installed plugin
++        // set). Reject path-like or URL-like specifiers that would turn the
++        // dynamic import into arbitrary file/network access.
++        if (name.startsWith('/') || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(name)) {
++          throw new Error(`loader: refusing bare import "${name}" — only package specifiers and relative paths are allowed`)
++        }
+         return await import(/* @vite-ignore */name)
+       }
+     }, getOuterStack)
