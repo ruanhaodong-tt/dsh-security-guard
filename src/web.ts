@@ -1,5 +1,5 @@
 import { Context } from "@deepseek-ai/cordis"
-import { z } from "@deepseek-ai/schemastery"
+import z from "@deepseek-ai/schemastery"
 import type { Server } from "node:http"
 
 export const name = "dsh-security-web"
