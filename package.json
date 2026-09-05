@@ -10,26 +10,24 @@
     "url": "git+https://github.com/ruanhaodong-tt/dsh-security-guard.git"
   },
   "type": "module",
-  "main": "lib/core.js",
-  "types": "lib/core.d.ts",
+  "main": "src/core.ts",
+  "types": "src/core.ts",
   "exports": {
     "./core": {
-      "types": "./lib/core.d.ts",
-      "default": "./lib/core.js"
+      "types": "./src/core.ts",
+      "default": "./src/core.ts"
     },
     "./web": {
-      "types": "./lib/web.d.ts",
-      "default": "./lib/web.js"
+      "types": "./src/web.ts",
+      "default": "./src/web.ts"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/core.js",
-    "lib/core.d.ts",
-    "lib/web.js",
-    "lib/web.d.ts",
+    "src/core.ts",
+    "src/web.ts",
     "cordis.patch.yml"
   ],
   "license": "MIT",
